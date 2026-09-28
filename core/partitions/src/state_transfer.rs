@@ -1183,7 +1183,8 @@ pub enum PartitionArtifactSource<'a> {
 /// The offsets artifact can include a full checkpoint prepare.
 #[derive(Debug)]
 pub struct PartitionStateTransferOffer {
-    /// `== commit_min == commit_max` at build (caught-up primary gate).
+    /// `commit_min` when the offer's [`TransferPlan`] was pinned: the segments
+    /// hold every op through it and none after it.
     pub commit_op: u64,
     /// Ascending base offset; one artifact per non-empty retained segment.
     pub segments: Vec<SegmentArtifactSource>,
@@ -1228,6 +1229,28 @@ impl PartitionStateTransferOffer {
             .sum::<u64>()
             + self.offsets.0.len
     }
+}
+
+/// The state one offer describes, captured in the turn that found every
+/// applied op in its segment and none after it. Later commits only append past
+/// these lengths, so hash rounds that span them still describe `commit_op`.
+pub(crate) struct TransferPlan {
+    commit_op: u64,
+    /// A purge truncates every file and restarts the offset space, so a size
+    /// that grew back past its planned length would pass the size re-check
+    /// while the stamps describe post-purge bytes at pre-purge offsets.
+    purge_generation: u64,
+    /// `(start_offset, len, log_path)` of each non-empty segment.
+    segments: Vec<(u64, u64, String)>,
+    offsets: ConsumerOffsetsWire,
+}
+
+/// How far a serving partition got toward the plan its offer rounds share.
+pub(crate) enum TransferPlanSlot {
+    /// A request waits for the flush that has to come before the capture.
+    Wanted,
+    Pinned(Rc<TransferPlan>),
+    Failed(PartitionTransferUnavailable),
 }
 
 /// Why a partition cannot serve a state transfer right now.
@@ -1311,6 +1334,13 @@ impl PartitionTransferUnavailable {
             | Self::FlushFailed(_)
             | Self::SegmentUnreadable { .. } => false,
         }
+    }
+
+    /// Whether the next request resumes the build this round refused. Only
+    /// these keep the shard's admission slot and the partition's plan.
+    #[must_use]
+    pub const fn resumable(&self) -> bool {
+        matches!(self, Self::FlushPending | Self::OfferBuildInProgress { .. })
     }
 }
 
@@ -1965,20 +1995,38 @@ where
 
     /// Build (or serve from cache) this group's state-transfer offer.
     ///
-    /// Force-flushes the committed prefix first so the segments cover every
-    /// committed `SendMessages` op and the offset table covers every
-    /// committed offset op; `commit_op = commit_min` then names the exact
-    /// state the artifacts represent. Segment bytes are NOT loaded here: the
-    /// offer records `(entry, path)` and the serving side loads one artifact
-    /// at a time, so building costs one streaming checksum pass per segment
-    /// and the resident footprint is the offsets artifact, including the
-    /// checkpoint prepare.
+    /// Hashes against a [`TransferPlan`] pinned in the turn that found every
+    /// applied op in its segment, so the segments cover every committed
+    /// `SendMessages` op through the plan's `commit_op`, the offset table
+    /// covers every committed offset op, and commits that land between rounds
+    /// cannot move the state the artifacts represent. Segment bytes are NOT
+    /// loaded here: the offer records `(entry, path)` and the serving side
+    /// loads one artifact at a time, so building costs one streaming checksum
+    /// pass per segment and the resident footprint is the offsets artifact,
+    /// including the checkpoint prepare.
     ///
     /// # Errors
     /// [`PartitionTransferUnavailable`]; the requester falls back to journal
     /// repair or retries after the next trigger.
-    #[allow(clippy::too_many_lines)]
     pub async fn state_transfer_offer(
+        &mut self,
+        config: &PartitionsConfig,
+    ) -> Result<Rc<PartitionStateTransferOffer>, PartitionTransferUnavailable> {
+        let offer = self.build_state_transfer_offer(config).await;
+        // A primary that has yet to apply what it committed keeps its plan:
+        // the plan still names committed state, and under steady writes the
+        // lag comes and goes between rounds.
+        if !offer.as_ref().is_err_and(|refusal| {
+            refusal.resumable()
+                || matches!(refusal, PartitionTransferUnavailable::NotCaughtUpPrimary)
+        }) {
+            self.transfer_plan.borrow_mut().take();
+        }
+        offer
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn build_state_transfer_offer(
         &mut self,
         config: &PartitionsConfig,
     ) -> Result<Rc<PartitionStateTransferOffer>, PartitionTransferUnavailable> {
@@ -2012,16 +2060,8 @@ where
         if self.consensus().commit_max() == 0 && self.installed_frontier.is_none() {
             return Err(PartitionTransferUnavailable::NothingCommitted);
         }
-        if !self
-            .flush_committed_messages(config)
-            .await
-            .map_err(PartitionTransferUnavailable::FlushFailed)?
-        {
-            return Err(PartitionTransferUnavailable::FlushPending);
-        }
-        let commit_op = self.consensus().commit_min();
         if let Some(cached) = self.transfer_offer_cache.borrow().as_ref()
-            && cached.commit_op == commit_op
+            && cached.commit_op == self.consensus().commit_min()
         {
             // Returns BEFORE the chain re-validation below, deliberately:
             // re-validating on every hit is the walk the cache exists to skip.
@@ -2030,40 +2070,10 @@ where
             // re-enumerates -- which is the cheaper side of the trade.
             return Ok(Rc::clone(cached));
         }
-
-        // Enumerate under the write lock so GC (`remove_sealed_segments_up_to`,
-        // also write-locked) cannot unlink a file between enumeration and read.
-        // The checksum passes below run with the lock RELEASED: they are the
-        // expensive part, and the same mutex serializes
-        // `append_send_messages_to_journal` and `commit_messages_inner`, so
-        // holding it across a multi-GiB first pass stalls this partition's
-        // produce and commit for the whole pass. The chain is re-validated
-        // under the lock afterwards.
-        let write_lock = self.write_lock.clone();
-        // Sampled with the chain: a purge inside the hash window below both
-        // truncates every file and restarts the offset space, so a size that
-        // grew back past its planned length would pass the size re-check while
-        // the stamps describe post-purge bytes at pre-purge offsets.
-        let planned_purge_generation = self.applied_purge_generation;
-        let planned: Vec<(u64, u64, String)> = {
-            let _guard = write_lock.lock().await;
-            let mut planned = Vec::with_capacity(self.log.segments().len());
-            for (segment, storage) in self.log.segments().iter().zip(self.log.storages()) {
-                let size = segment.size.as_bytes_u64();
-                if size == 0 {
-                    continue;
-                }
-                let (log_path, _) = storage.segment_and_index_paths();
-                let Some(log_path) = log_path else {
-                    return Err(PartitionTransferUnavailable::SegmentUnreadable {
-                        start_offset: segment.start_offset,
-                        source: std::io::Error::other("segment holds bytes but no backing file"),
-                    });
-                };
-                planned.push((segment.start_offset, size, log_path));
-            }
-            planned
+        let Some(plan) = self.request_transfer_plan(config).await? else {
+            return Err(PartitionTransferUnavailable::FlushPending);
         };
+        let planned = plan.segments.as_slice();
         // One manifest entry per planned segment plus the offsets table. The
         // manifest encoder ASSERTS its entry ceiling and that assert survives
         // release builds, so a partition retaining more segments than the
@@ -2093,7 +2103,7 @@ where
         // until the offer completes.
         let mut budget = OFFER_HASH_BUDGET_PER_ROUND_BYTES;
         let mut segments = Vec::with_capacity(planned.len());
-        for (start_offset, size, log_path) in &planned {
+        for (start_offset, size, log_path) in planned {
             let Some(checksum) = self
                 .segment_checksum(*start_offset, *size, log_path, &mut budget)
                 .await?
@@ -2104,13 +2114,13 @@ where
                 // segment), so they render identically on round 1 and round 30
                 // and an operator cannot tell a converging pass from a wedged
                 // one. This is the only window onto a multi-round build.
-                let hashed = self.hashed_prefix_len(&planned);
+                let hashed = self.hashed_prefix_len(planned);
                 let total = planned.iter().map(|(_, size, _)| *size).sum::<u64>();
                 // The completing round's sweep is skipped on this path, so
                 // prune here too: retention GC can unlink segments across a
                 // long build, and their memos would otherwise accumulate until
                 // some round finally runs the loop to the end.
-                self.retain_segment_checksum_memos(&planned);
+                self.retain_segment_checksum_memos(planned);
                 return Err(PartitionTransferUnavailable::OfferBuildInProgress {
                     hashed,
                     remaining: total.saturating_sub(hashed),
@@ -2127,12 +2137,13 @@ where
             });
         }
 
-        // Re-validate the chain under the lock: the passes above yielded, so GC
-        // could have unlinked a sealed segment or a purge could have planted a
-        // fresh file at a planned path. Every stamp would then describe bytes
-        // the offer no longer addresses, so refuse and let the requester ask
-        // again against the chain that exists now.
+        // Re-validate the chain under the lock: the plan outlives the rounds
+        // that hash it, so GC could have unlinked a sealed segment or a purge
+        // could have planted a fresh file at a planned path. Every stamp would
+        // then describe bytes the offer no longer addresses, so refuse and let
+        // the requester ask again against the chain that exists now.
         {
+            let write_lock = self.write_lock.clone();
             let _guard = write_lock.lock().await;
             let live: std::collections::HashMap<u64, u64> = self
                 .log
@@ -2142,7 +2153,7 @@ where
                 .collect();
             // Append-only within a segment instance, so a live size BELOW the
             // planned one means the file was replaced rather than extended.
-            let changed = planned_purge_generation != self.applied_purge_generation
+            let changed = plan.purge_generation != self.applied_purge_generation
                 || planned.iter().any(|(start_offset, size, _)| {
                     live.get(start_offset)
                         .is_none_or(|live_size| live_size < size)
@@ -2161,26 +2172,53 @@ where
         // serve it only when a recorded purge says the emptiness is the truth.
         // `install_state_transfer`'s `purge_advances` check re-decides that
         // against the metadata plane and refuses the rest.
-        let offsets_wire = self.offsets_wire_snapshot()?;
         if segments.is_empty()
-            && offsets_wire.next_offset == 0
-            && offsets_wire.purge_generation == 0
+            && plan.offsets.next_offset == 0
+            && plan.offsets.purge_generation == 0
         {
             return Err(PartitionTransferUnavailable::NothingCommitted);
         }
-        let offsets_bytes = Rc::new(offsets_wire.encode());
+        let offsets_bytes = Rc::new(plan.offsets.encode());
         let offsets_entry = consensus::StateArtifact::for_bytes(
             artifact_kind::CONSUMER_OFFSETS,
-            commit_op,
+            plan.commit_op,
             &offsets_bytes,
         );
         let offer = Rc::new(PartitionStateTransferOffer {
-            commit_op,
+            commit_op: plan.commit_op,
             segments,
             offsets: (offsets_entry, offsets_bytes),
         });
         *self.transfer_offer_cache.borrow_mut() = Some(Rc::clone(&offer));
         Ok(offer)
+    }
+
+    /// The caller guarantees that the segments hold every applied op and none
+    /// after it, which makes `commit_min` the op the captured state is at.
+    pub(crate) fn capture_transfer_plan(
+        &self,
+    ) -> Result<TransferPlan, PartitionTransferUnavailable> {
+        let mut segments = Vec::with_capacity(self.log.segments().len());
+        for (segment, storage) in self.log.segments().iter().zip(self.log.storages()) {
+            let size = segment.size.as_bytes_u64();
+            if size == 0 {
+                continue;
+            }
+            let (log_path, _) = storage.segment_and_index_paths();
+            let Some(log_path) = log_path else {
+                return Err(PartitionTransferUnavailable::SegmentUnreadable {
+                    start_offset: segment.start_offset,
+                    source: std::io::Error::other("segment holds bytes but no backing file"),
+                });
+            };
+            segments.push((segment.start_offset, size, log_path));
+        }
+        Ok(TransferPlan {
+            commit_op: self.consensus().commit_min(),
+            purge_generation: self.applied_purge_generation,
+            segments,
+            offsets: self.offsets_wire_snapshot()?,
+        })
     }
 
     /// Bytes of `planned` the memo already covers, clamped per segment to the
@@ -2290,9 +2328,11 @@ where
     }
 
     /// Release the cached offer once no requester holds one (the shard's
-    /// offer-expiry sweep).
+    /// offer-expiry sweep), and the plan of a build in progress with it: both
+    /// name segments that retention may be about to unlink.
     pub fn clear_state_transfer_offer_cache(&self) {
         self.transfer_offer_cache.borrow_mut().take();
+        self.transfer_plan.borrow_mut().take();
     }
 
     fn validate_consumer_offset_transfer_counts(&self) -> Result<(), PartitionTransferUnavailable> {

@@ -32,7 +32,9 @@ use crate::poll_plan::{
     PollTier, ResidentTailSnapshot,
 };
 use crate::segment::Segment;
-use crate::state_transfer::{PartitionTransferSession, PendingTransferRearm};
+use crate::state_transfer::{
+    PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
+};
 use crate::types::{COMMIT_WALK_OPS_MAX, FatalCommit, RepairConclusion, RepairSession};
 use crate::{
     AppendResult, Partition, PartitionOffsets, PartitionsConfig, PollFragments, PollQueryResult,
@@ -385,6 +387,10 @@ where
     /// different bytes) and released by the shard's offer-expiry sweep.
     pub(crate) transfer_offer_cache:
         RefCell<Option<Rc<crate::state_transfer::PartitionStateTransferOffer>>>,
+    /// Serving-side plan the rounds of one offer build share. Released when
+    /// the build ends, with the offer cache, and with the history it
+    /// describes.
+    pub(crate) transfer_plan: RefCell<Option<TransferPlanSlot>>,
 }
 
 impl<B, SB> fmt::Debug for IggyPartition<B, SB>
@@ -715,7 +721,6 @@ struct PendingPartitionMaintenance {
     flush_drain: Option<crate::PersistenceDrain>,
     flush_completed_through: Option<u64>,
     transfer_flush: bool,
-    transfer_flush_failed: bool,
     shutdown: Option<PartitionShutdownPhase>,
     shutdown_drain: Option<crate::PersistenceDrain>,
     checkpoint: Option<PendingCheckpoint>,
@@ -843,6 +848,7 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
+    #[allow(clippy::too_many_lines)]
     pub fn new(stats: Arc<PartitionStats>, consensus: VsrConsensus<B>) -> Self {
         let observed_view = consensus.view();
         let single_replica = consensus.replica_count() == 1;
@@ -939,6 +945,7 @@ where
             segment_checksum_cache: RefCell::new(std::collections::HashMap::new()),
             reuse_scan_memo: RefCell::new(None),
             transfer_offer_cache: RefCell::new(None),
+            transfer_plan: RefCell::new(None),
         };
         if single_replica {
             partition.log.journal().inner.set_repair_retention(false);
@@ -3572,11 +3579,12 @@ where
     /// Invalidate after preflight, before replacing data or progress.
     /// Preserve the identity when preflight leaves served state unchanged.
     /// Queued automatic commits also belong to the old history, even when
-    /// their reads have already completed.
+    /// their reads have already completed. So does a pinned transfer plan.
     pub(crate) fn invalidate_poll_history(&mut self) {
         self.workerless_offset_files.clear();
         self.poll_history = PollHistoryId::default();
         self.discard_queued_auto_commits();
+        self.transfer_plan.borrow_mut().take();
     }
 
     fn discard_queued_auto_commits(&self) {
@@ -3620,7 +3628,11 @@ where
         // poll would report progress the group never agreed, and a later
         // read on the primary would hand the same messages out again.
         // Refusing keeps the outcome retriable on a replica that can commit.
-        if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
+        if !consensus.is_primary()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+            || self.refuses_prepares()
+        {
             return Err(IggyError::TransientNotAccepted);
         }
 
@@ -3678,12 +3690,24 @@ where
                 .with_pipeline(|pipeline| !pipeline.is_empty())
     }
 
+    /// `on_replicate` journals nothing during a transition, retirement or
+    /// shutdown, so a primary must not originate a prepare while this holds.
+    fn refuses_prepares(&self) -> bool {
+        self.transition.is_some()
+            || self.io_active.is_retiring()
+            || self.maintenance.shutdown.is_some()
+    }
+
     fn pipeline_local_request(
         &self,
         message: Message<RoutedRequestHeader>,
         sender: Option<consensus::Sender<Message<ReplyHeader>>>,
         order: Option<LocalRequestOrder>,
     ) -> Message<PrepareHeader> {
+        debug_assert!(
+            !self.refuses_prepares(),
+            "on_replicate would drop a prepare that the pipeline already holds"
+        );
         let prepare = message.project(&self.consensus);
         self.consensus.verify_pipeline();
         self.consensus
@@ -5156,6 +5180,9 @@ where
         if self.materialization_missing {
             return Ok(crate::PartitionIoStep::Pending);
         }
+        if self.drive_transfer_plan() {
+            return Ok(crate::PartitionIoStep::Progress);
+        }
         if let Some(step) = self.drive_checkpoint_io(config)? {
             return Ok(step);
         }
@@ -5171,6 +5198,10 @@ where
                 return self.io_plan(crate::PartitionIoContinuation::Retention);
             }
             self.maintenance.retention = None;
+        }
+        if self.maintenance.shutdown.is_some() && self.consensus.request_queue_len() > 0 {
+            self.deny_queued_requests().await;
+            return Ok(crate::PartitionIoStep::Progress);
         }
         if self.io_promotions > 0 || self.queued_requests_ready() {
             self.io_promotions = self.io_promotions.saturating_sub(1);
@@ -5516,7 +5547,12 @@ where
             self.materialization = None;
             self.finish_flush();
             self.maintenance.flush_completed_through = None;
-            self.maintenance.transfer_flush_failed = true;
+            let mut plan = self.transfer_plan.borrow_mut();
+            if matches!(*plan, Some(TransferPlanSlot::Wanted)) {
+                *plan = Some(TransferPlanSlot::Failed(
+                    PartitionTransferUnavailable::FlushFailed(error.clone()),
+                ));
+            }
         } else {
             self.fail_pending_commit(error);
             self.fence_flush_failure();
@@ -5551,6 +5587,81 @@ where
         {
             persistence.finish_drain(&drain);
         }
+    }
+
+    /// The plan an offer round hashes against, or `None` while the flush that
+    /// has to come before it runs. A mounted owner pins the plan in the I/O
+    /// turn that finds every applied op in its segment, so commits landing
+    /// between rounds cannot starve it. One without an owner flushes and
+    /// captures inline.
+    pub(crate) async fn request_transfer_plan(
+        &mut self,
+        config: &PartitionsConfig,
+    ) -> Result<Option<Rc<crate::state_transfer::TransferPlan>>, PartitionTransferUnavailable> {
+        if !self.has_io_dispatcher() {
+            if !self
+                .flush_committed_messages(config)
+                .await
+                .map_err(PartitionTransferUnavailable::FlushFailed)?
+            {
+                return Ok(None);
+            }
+            return self.capture_transfer_plan().map(|plan| Some(Rc::new(plan)));
+        }
+        if self.fatal.is_some() {
+            return Err(PartitionTransferUnavailable::FlushFailed(
+                IggyError::CannotSyncFile,
+            ));
+        }
+        // A purge, an install or a quarantine rewrites the files a plan names.
+        if self.transition.is_some() || self.io_active.is_retiring() {
+            return Ok(None);
+        }
+        let slot = self.transfer_plan.borrow_mut().take();
+        match slot {
+            Some(TransferPlanSlot::Pinned(plan)) => {
+                *self.transfer_plan.borrow_mut() = Some(TransferPlanSlot::Pinned(Rc::clone(&plan)));
+                Ok(Some(plan))
+            }
+            Some(TransferPlanSlot::Failed(error)) => Err(error),
+            Some(TransferPlanSlot::Wanted) | None => {
+                *self.transfer_plan.borrow_mut() = Some(TransferPlanSlot::Wanted);
+                self.notify_io();
+                Ok(None)
+            }
+        }
+    }
+
+    /// Pins the plan a transfer request waits for in the turn that finds every
+    /// applied op in its segment, flushing the applied prefix first while any
+    /// of it is still resident.
+    fn drive_transfer_plan(&mut self) -> bool {
+        if !matches!(*self.transfer_plan.borrow(), Some(TransferPlanSlot::Wanted))
+            || self.history_writes_pending()
+        {
+            return false;
+        }
+        let commit_min = self.consensus.commit_min();
+        if self.log.journal().inner.committed_prefix_len(commit_min) > 0 {
+            self.maintenance.transfer_flush = true;
+            self.request_flush(commit_min);
+            return true;
+        }
+        // A flush through a committed op the walk has not applied yet leaves
+        // its bytes in the segments, past the op the plan would name.
+        if self.consensus.commit_max() > commit_min
+            && !commit_min
+                .checked_add(1)
+                .is_some_and(|next| self.log.journal().inner.holds_op(next))
+        {
+            return false;
+        }
+        let slot = match self.capture_transfer_plan() {
+            Ok(plan) => TransferPlanSlot::Pinned(Rc::new(plan)),
+            Err(error) => TransferPlanSlot::Failed(error),
+        };
+        *self.transfer_plan.borrow_mut() = Some(slot);
+        true
     }
 
     fn drive_shutdown_io(&mut self) -> crate::PartitionIoStep {
@@ -6230,7 +6341,7 @@ where
     /// A reservation wait retains the original queue head and its reply sender.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn drain_request_queue_into_prepares(&mut self, slots_freed: usize) {
-        if self.transition.is_some() || self.io_active.is_retiring() {
+        if self.refuses_prepares() {
             self.notify_io();
             return;
         }
@@ -6434,6 +6545,22 @@ where
         })
     }
 
+    /// Shutdown promotes nothing, so answer every queued request now. None
+    /// holds an op yet, so its client can safely retry it.
+    async fn deny_queued_requests(&self) {
+        while let Some(mut request) = self.consensus.pop_queued_request() {
+            let waiter = request.take_reply_sender();
+            Self::send_partition_deny_or_log(
+                &self.consensus,
+                request.message.header(),
+                IggyError::TransientNotAccepted.as_code(),
+                "shutdown queued request reply failed",
+                waiter,
+            )
+            .await;
+        }
+    }
+
     /// Resume a bounded promotion turn without waiting for another commit.
     pub async fn resume_queued_requests(&mut self) {
         if self.queued_requests_ready() {
@@ -6447,10 +6574,7 @@ where
     /// which is unrecoverable in place.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn on_replicate(&mut self, message: Message<PrepareHeader>) {
-        if self.transition.is_some()
-            || self.io_active.is_retiring()
-            || self.maintenance.shutdown.is_some()
-        {
+        if self.refuses_prepares() {
             self.notify_io();
             return;
         }
@@ -7411,7 +7535,7 @@ where
         config: &PartitionsConfig,
     ) -> Result<bool, IggyError> {
         if self.has_io_dispatcher() {
-            if self.fatal.is_some() || std::mem::take(&mut self.maintenance.transfer_flush_failed) {
+            if self.fatal.is_some() {
                 return Err(IggyError::CannotSyncFile);
             }
             if self.history_is_busy() {
@@ -7426,7 +7550,6 @@ where
             {
                 return Ok(true);
             }
-            self.maintenance.transfer_flush = true;
             self.request_flush(through);
             return Ok(false);
         }
@@ -11124,6 +11247,76 @@ mod tests {
             receiver.consensus().last_prepare_checksum(),
             committed.header().checksum
         );
+    }
+
+    /// Steady writes keep an applied op resident on every round, so a build
+    /// that demanded a flushed journal per round never got its offer. The plan
+    /// pinned by the first flush carries the build, and the offer names the
+    /// pinned op, not the later one whose bytes the segment lacks.
+    #[compio::test]
+    async fn given_ops_committing_between_rounds_when_transfer_offer_builds_should_serve_the_pinned_op()
+     {
+        const THRESHOLD: u32 = 8;
+        let mut config = repair_config();
+        config.messages_required_to_save = THRESHOLD;
+        let (_directory, mut partition) = Box::pin(disk_poll_partition(&config)).await;
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        journal_send_batch(&mut partition, 1).await;
+        partition.consensus().advance_commit_max(1);
+        settle_partition_io(&mut partition, &config).await;
+        assert_eq!(partition.consensus().commit_min(), 1);
+        assert!(partition.log.journal().inner.holds_op(1));
+
+        assert!(matches!(
+            partition.state_transfer_offer(&config).await,
+            Err(crate::state_transfer::PartitionTransferUnavailable::FlushPending)
+        ));
+        settle_partition_io(&mut partition, &config).await;
+        let planned_len = partition.log.active_segment().size.as_bytes_u64();
+        assert!(planned_len > 0, "the transfer flush writes the applied op");
+
+        journal_send_batch(&mut partition, 2).await;
+        partition.consensus().advance_commit_max(2);
+        settle_partition_io(&mut partition, &config).await;
+        assert_eq!(partition.consensus().commit_min(), 2);
+        assert!(partition.log.journal().inner.holds_op(2));
+
+        let offer = partition.state_transfer_offer(&config).await.unwrap();
+        assert_eq!(offer.commit_op, 1);
+        assert_eq!(offer.segments.len(), 1);
+        assert_eq!(offer.segments[0].entry.len, planned_len);
+        assert!(
+            partition.transfer_plan.borrow().is_none(),
+            "a finished build releases its plan"
+        );
+    }
+
+    /// Run the owner's I/O continuations the way the shard lane would, until
+    /// nothing is left to do.
+    async fn settle_partition_io(
+        partition: &mut IggyPartition<IggyMessageBus>,
+        config: &PartitionsConfig,
+    ) {
+        const STEPS_MAX: usize = 64;
+        for _ in 0..STEPS_MAX {
+            match partition.resume_io(config).await {
+                crate::PartitionIoStep::Ready(plan) => {
+                    let captured = partition.capture_io(plan, config).unwrap().unwrap();
+                    let result = captured.job.execute().await;
+                    partition.accept_io(captured.identity, result).unwrap();
+                    if let Some(gate) = captured.gate {
+                        gate.release();
+                    }
+                }
+                crate::PartitionIoStep::Progress => {}
+                crate::PartitionIoStep::Pending => return,
+                _ => panic!("unexpected partition I/O continuation"),
+            }
+        }
+        panic!("partition I/O did not settle in {STEPS_MAX} steps");
     }
 
     #[compio::test]
@@ -15206,6 +15399,77 @@ mod tests {
             assert_eq!(partition.group_offset_state(7), (None, None));
             assert_eq!(partition.consensus.pipeline_len(), 0);
         }
+    }
+
+    /// `on_replicate` refuses prepares during shutdown, retirement and a
+    /// transition. An automatic commit admitted then would hold a pipeline
+    /// slot that no journal backs, and every later op would wait behind it.
+    #[test]
+    fn given_primary_refusing_prepares_when_auto_commit_poll_completes_should_reject_without_progress()
+     {
+        let refusals: [fn(&mut IggyPartition<RecordingBus>); 3] = [
+            IggyPartition::begin_shutdown_io,
+            |partition| partition.stop_io_admission(),
+            |partition| {
+                let message =
+                    Message::<iggy_binary_protocol::RequestStartViewHeader>::new(size_of::<
+                        iggy_binary_protocol::RequestStartViewHeader,
+                    >(
+                    ));
+                partition
+                    .defer_view_transition(server_common::MessageBag::RequestStartView(message));
+            },
+        ];
+        for refuse in refusals {
+            let (mut partition, _) = recording_partition();
+            let consumer = PollingConsumer::Consumer(7, 0);
+            let read_result = poll_read_result(&partition, consumer, true, Some(9));
+            refuse(&mut partition);
+            assert!(matches!(
+                partition.complete_poll(read_result),
+                Err(IggyError::TransientNotAccepted)
+            ));
+            assert_eq!(partition.get_consumer_offset(consumer), None);
+            assert_eq!(partition.consensus.pipeline_len(), 0);
+        }
+    }
+
+    /// Shutdown promotes no queued request, because `on_replicate` would drop
+    /// its prepare and `DrainAccepted` would wait for it until the pump drain
+    /// times out, skipping the final flush.
+    #[compio::test]
+    async fn given_queued_request_when_shutdown_drains_should_deny_it_and_complete() {
+        const STEPS_MAX: usize = 32;
+        let (mut partition, replies) = recording_partition();
+        partition.set_io_notifier(
+            Rc::new(|_, _| {}),
+            crate::largest_legal_job_charge().unwrap(),
+        );
+        let order = partition.next_local_request_order().unwrap();
+        let request = consensus::RequestEntry::with_sender(
+            checksumless_send_request(partition.namespace(), 1),
+            None,
+        );
+        assert!(partition.queue_local_request(request, order).is_ok());
+
+        partition.begin_shutdown_io();
+        let config = repair_config();
+        for _ in 0..STEPS_MAX {
+            if partition.shutdown_io_complete() {
+                break;
+            }
+            partition.resume_io(&config).await;
+        }
+
+        assert!(partition.shutdown_io_complete());
+        assert_eq!(partition.consensus.pipeline_len(), 0);
+        assert_eq!(partition.consensus.request_queue_len(), 0);
+        let replies = replies.borrow();
+        assert_eq!(replies.len(), 1);
+        let reply = bytemuck::checked::from_bytes::<ReplyHeader>(
+            &replies[0].1.as_slice()[..size_of::<ReplyHeader>()],
+        );
+        assert_eq!(reply.status, IggyError::TransientNotAccepted.as_code());
     }
 
     #[test]

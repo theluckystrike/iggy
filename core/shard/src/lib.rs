@@ -8411,14 +8411,11 @@ where
                         // what keeps a routine refusal from charging its failure
                         // count.
                         //
-                        // The slot survives ONLY a budget-exhausted round, which is
-                        // a build that will resume; every other refusal abandons
-                        // the build and must not keep the group admitted.
-                        let building = matches!(
-                        reason,
-                        partitions::state_transfer::PartitionTransferUnavailable::OfferBuildInProgress { .. }
-                    );
-                        if !building {
+                        // The slot survives ONLY a round the build resumes from (a
+                        // pending flush or a spent hash budget); every other
+                        // refusal abandons the build and must not keep the group
+                        // admitted.
+                        if !reason.resumable() {
                             self.partition_offer_builds
                                 .borrow_mut()
                                 .remove(&header.group);
@@ -9937,6 +9934,7 @@ where
         // A build slot is released by the round that completes the offer, so a
         // requester that walked away mid-build would otherwise hold admission
         // forever. Same idle window as an abandoned offer.
+        let mut abandoned = Vec::new();
         self.partition_offer_builds
             .borrow_mut()
             .retain(|namespace, idle_ticks| {
@@ -9948,6 +9946,7 @@ where
                         namespace_raw = namespace,
                         "dropping an abandoned partition offer build slot"
                     );
+                    abandoned.push(*namespace);
                 }
                 live
             });
@@ -9990,9 +9989,12 @@ where
         }
         // Partition offer caches: release each namespace whose LAST offer
         // just aged out, so a served-once partition does not pin its offer
-        // (manifest + offsets table) for the process lifetime.
+        // (manifest + offsets table) for the process lifetime, and each whose
+        // build was abandoned, so its pinned plan cannot answer a much later
+        // request with stale state.
         let mut vanished = namespaces_before;
         vanished.retain(|namespace| !offers.keys().any(|(live, _)| live == namespace));
+        vanished.extend(abandoned);
         vanished.sort_unstable();
         vanished.dedup();
         drop(offers);
