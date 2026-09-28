@@ -49,6 +49,7 @@ use journal::durable_storage::{DiskStorage, DurableStorage};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::Message;
+use server_common::fatal::ExitOnDescriptorExhaustion;
 use server_common::iobuf::Owned;
 use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
 use server_common::{SegmentStorage, yield_to_reactor};
@@ -1593,7 +1594,8 @@ pub async fn mark_materialization_missing(directory: &str, revision: u64) -> std
         .truncate(true)
         .write(true)
         .open(&temporary)
-        .await?;
+        .await
+        .exit_on_descriptor_exhaustion(|| format!("opening {}", temporary.display()))?;
     file.write_all_at(revision.to_le_bytes().to_vec(), 0)
         .await
         .0?;
@@ -1835,7 +1837,8 @@ async fn discard_offset_writes(planned: &[PlannedOffsetWrite]) {
 /// every other future on the pump keeps running through it.
 pub(crate) async fn fsync_dir(partition_dir: &str) -> std::io::Result<()> {
     compio::fs::File::open(partition_dir)
-        .await?
+        .await
+        .exit_on_descriptor_exhaustion(|| format!("opening directory {partition_dir}"))?
         .sync_all()
         .await
 }
@@ -2997,6 +3000,7 @@ where
         // is an `open`+`close` per segment for no durability gain.
         let dir_handle = compio::fs::File::open(partition_dir)
             .await
+            .exit_on_descriptor_exhaustion(|| format!("opening directory {partition_dir}"))
             .map_err(|source| PartitionInstallError::SwapIo {
                 path: partition_dir.to_owned(),
                 source,
@@ -3980,7 +3984,9 @@ fn segment_manifest_digest(manifest: &[consensus::StateArtifact]) -> u64 {
 }
 
 async fn write_staging_file(path: &Path, payload: Vec<u8>) -> std::io::Result<()> {
-    let mut file = compio::fs::File::create(path).await?;
+    let mut file = compio::fs::File::create(path)
+        .await
+        .exit_on_descriptor_exhaustion(|| format!("creating {}", path.display()))?;
     let (result, _) = file.write_all_at(payload, 0).await.into();
     result?;
     file.sync_data().await?;

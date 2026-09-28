@@ -24,6 +24,7 @@
 //! the leaves hold the support it calls into.
 
 mod credentials;
+mod fd_limit;
 mod handoff;
 mod listeners;
 mod recovery;
@@ -34,6 +35,7 @@ mod topology;
 
 pub use crate::dispatch::host::ServerHost;
 pub use credentials::apply_default_root_credentials;
+pub use fd_limit::{OpenFileLimit, OpenFileLimitError, raise_open_file_limit};
 pub use threads::ShardHandles;
 
 use crate::boot::credentials::{
@@ -600,6 +602,7 @@ async fn shard_main(
     // table from scratch, so running it afterwards would drop every resumed
     // session (and trip its empty-table assert).
     metadata.set_clients_table_max(config.metadata.clients_table_max);
+    metadata.set_partitions_max(config.metadata.partitions_max);
     // Reinstall the sessions recovery restored from the checkpoint and the WAL
     // suffix, so a rebooted node dedups retries and admits continuations from
     // clients that kept their identity across the restart (IGGY-137). Recovery
@@ -823,12 +826,29 @@ async fn shard_main(
     } else {
         None
     };
+
+    // Sysinfo printer: shard 0 only, since the line describes the whole
+    // process. A zero interval disables it.
+    let sysinfo_print_interval = config.logging.sysinfo_print_interval;
+    let sysinfo_printer_stop = if shard_id == 0 && !sysinfo_print_interval.is_zero() {
+        let (stop_tx, stop_rx) = channel(1);
+        let printer_shard = Rc::clone(&shard);
+        let interval = sysinfo_print_interval.get_duration();
+        let printer_handle = compio::runtime::spawn(async move {
+            crate::sysinfo_printer::run_sysinfo_printer(printer_shard, stop_rx, interval).await;
+        });
+        bus.track_background(printer_handle);
+        Some(stop_tx)
+    } else {
+        None
+    };
     let mut stop_signals = StopSignals {
         pump: stop_tx,
         reconciler: reconcile_stop_tx,
         heartbeat: heartbeat_stop_tx,
         pat_cleaner: pat_cleaner_stop,
         segment_cleaner: segment_cleaner_stop,
+        sysinfo_printer: sysinfo_printer_stop,
         consumer_group_liveness: None,
     };
 

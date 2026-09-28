@@ -33,6 +33,7 @@
 //! cross-transport invariant in `message_bus::client_listener`). Handshaken
 //! streams flow to the serve loop over a bounded channel.
 
+use message_bus::accept::pause_after_accept_error;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -231,7 +232,10 @@ async fn accept_pump(
                 Ok((stream, peer)) => {
                     spawn_handshake(&acceptor, &connections, handshake_grace, stream, peer);
                 }
-                Err(error) => error!(%error, "server HTTPS accept failed"),
+                Err(error) => {
+                    error!(%error, "server HTTPS accept failed");
+                    pause_after_accept_error(&error).await;
+                }
             },
         }
     }

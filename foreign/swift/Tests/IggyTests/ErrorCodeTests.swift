@@ -24,7 +24,7 @@ struct ErrorCodeTests {
     /// Pins the table to the server's `IggyError` discriminants: the count,
     /// both ends, and a code from every band.
     @Test func tableMatchesTheServerCodes() {
-        #expect(IggyErrorCode.allCases.count == 240)
+        #expect(IggyErrorCode.allCases.count == 241)
         #expect(IggyErrorCode.error.rawValue == 1)
         #expect(IggyErrorCode.allCases.map(\.rawValue).min() == 1)
         #expect(IggyErrorCode.allCases.map(\.rawValue).max() == 14003)
@@ -33,6 +33,7 @@ struct ErrorCodeTests {
         #expect(IggyErrorCode(rawValue: 58) == .transientNotAccepted)
         #expect(IggyErrorCode(rawValue: 1009) == .streamIdNotFound)
         #expect(IggyErrorCode(rawValue: 2010) == .topicIdNotFound)
+        #expect(IggyErrorCode(rawValue: 2022) == .partitionsLimitReached)
         #expect(IggyErrorCode(rawValue: 4042) == .invalidOptionValue)
         #expect(IggyErrorCode(rawValue: 5006) == .consumerGroupMemberNotFound)
         #expect(IggyErrorCode.streamIdNotFound.name == "stream_id_not_found")

@@ -75,6 +75,7 @@
 //! transport (TCP, TCP-TLS, WS, WSS, QUIC) plugs in behind the same
 //! registry, fencing, and dispatch logic.
 
+pub mod accept;
 pub mod cache;
 pub mod client_listener;
 pub mod config;

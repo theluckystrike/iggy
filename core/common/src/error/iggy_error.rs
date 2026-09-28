@@ -285,6 +285,11 @@ pub enum IggyError {
     TopicDirectoryNotFound(String) = 2020,
     #[error("Too many topics")]
     TooManyTopics = 2021,
+    /// Distinct from [`Self::TooManyPartitions`] by remedy: that one is cleared
+    /// by a smaller batch, this one by deleting partitions or raising the
+    /// node-wide cap.
+    #[error("Partitions limit reached, raise [metadata] partitions_max")]
+    PartitionsLimitReached = 2022,
     #[error("Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}")]
     CannotCreatePartition(usize, usize, usize) = 3000,
     #[error(
@@ -628,6 +633,14 @@ mod tests {
             IggyError::InvalidConsumerGroupName.as_string(),
             IggyError::from_code_as_string(GROUP_NAME_ERROR_CODE)
         )
+    }
+
+    #[test]
+    fn partitions_limit_reached_round_trips_by_code() {
+        let error = IggyError::PartitionsLimitReached;
+        assert_eq!(error.as_code(), 2022);
+        assert_eq!(IggyError::from_code(2022), error);
+        assert_eq!(IggyError::from_code_as_string(2022), error.as_string());
     }
 
     #[test]

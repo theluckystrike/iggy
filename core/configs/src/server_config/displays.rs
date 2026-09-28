@@ -86,8 +86,11 @@ impl Display for MetadataConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {} }}",
-            self.prepare_queue_depth, self.journal_slots, self.clients_table_max,
+            "{{ prepare_queue_depth: {}, journal_slots: {}, clients_table_max: {}, partitions_max: {} }}",
+            self.prepare_queue_depth,
+            self.journal_slots,
+            self.clients_table_max,
+            self.partitions_max,
         )
     }
 }

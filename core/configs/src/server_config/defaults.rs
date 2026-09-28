@@ -174,6 +174,7 @@ impl Default for MetadataConfig {
             prepare_queue_depth: metadata.prepare_queue_depth as usize,
             journal_slots: metadata.journal_slots as usize,
             clients_table_max: metadata.clients_table_max as usize,
+            partitions_max: metadata.partitions_max as u32,
         }
     }
 }
