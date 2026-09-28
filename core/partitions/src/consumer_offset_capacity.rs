@@ -381,8 +381,8 @@ impl ConsumerOffsetCapacity {
         self.stranded.borrow().len()
     }
 
-    pub(crate) fn stranded_ids(&self) -> HashSet<u32> {
-        self.stranded.borrow().clone()
+    pub(crate) fn extend_stranded_ids(&self, ids: &mut HashSet<u32>) {
+        ids.extend(self.stranded.borrow().iter().copied());
     }
 
     pub(crate) fn rearm_if_below_limit(&self, durable: &DurableConsumerOffsets) {

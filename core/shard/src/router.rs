@@ -550,11 +550,9 @@ where
 
         // Final flush: committed messages still resident in the in-memory
         // journal must reach segment storage before the process exits, or a
-        // graceful restart recovers consumer offsets ahead of the data. Runs
-        // on a fault too, the fenced partition included: its resident prefix
-        // is cluster-committed data, so writing what still reaches disk is
-        // strictly better than dropping it, and a second failure of an
-        // already-fenced partition is warned rather than propagated.
+        // graceful restart recovers consumer offsets ahead of the data. On a
+        // fault, healthy partitions still flush. A fenced partition skips the
+        // flush, leaving any resident committed data unpersisted at shutdown.
         self.flush_partitions(&mut loopback_buf).await;
         self.partition_io.close();
 

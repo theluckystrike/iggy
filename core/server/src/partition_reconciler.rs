@@ -1010,9 +1010,7 @@ async fn tear_down_owned_partition(
     // on_replicate / on_ack frames that haven't observed the queued
     // tombstone yet. Idempotent on retry: already-tombstoned namespace
     // stays tombstoned; already-removed shards_table row is a no-op.
-    let teardown = partitions
-        .get_io_owner(&ns)
-        .map(|partition| partition.capture_teardown());
+    let teardown = partitions.capture_teardown(&ns);
     if !partitions.is_tombstoned(&ns) {
         partitions.tombstone(ns);
     }

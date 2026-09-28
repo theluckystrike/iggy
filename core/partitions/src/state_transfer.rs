@@ -22,7 +22,7 @@
 //! A rejoining replica whose journal repair proved the gap below the commit
 //! floor is unrepairable (`RepairConclusion::FloorRefused`) pulls this
 //! partition's retained segments plus its consumer-offset table from the
-//! group's caught-up primary, installs them, and hands the live tail back to
+//! group's primary, installs them, and hands the live tail back to
 //! ordinary journal repair. Artifacts ride the plane-agnostic manifest/chunk
 //! protocol from `core/consensus`; everything in this module is the
 //! partition-specific payload handling on either end.
@@ -1313,10 +1313,10 @@ pub enum PartitionTransferUnavailable {
 impl PartitionTransferUnavailable {
     /// Whether the refusal says "not right now" rather than "this node is
     /// broken". A requester charges its consecutive-failure count (and the
-    /// exponential re-arm backoff behind it) only for the latter: a primary
-    /// that is momentarily behind its own frontier is the common case under
-    /// produce load, and charging it pins the backoff at its ceiling while
-    /// nothing else recovers the partition.
+    /// exponential re-arm backoff behind it) only for the latter: a build still
+    /// flushing or hashing is the common case under produce load, and charging
+    /// it pins the backoff at its ceiling while nothing else recovers the
+    /// partition.
     #[must_use]
     pub const fn transient(&self) -> bool {
         match self {
@@ -1418,7 +1418,8 @@ pub enum PartitionInstallError {
         kind: ConsumerKind,
     },
     /// `commit_op` fell below this replica's commit frontier; installing
-    /// would rewind `commit_min` (the anti-rewind assert, as a refusal).
+    /// would rewind `commit_min` (the anti-rewind assert, as a refusal) or
+    /// erase a committed op this replica holds.
     StaleTransfer {
         commit_op: u64,
         commit_min: u64,
@@ -1838,7 +1839,6 @@ pub(crate) struct PendingInstall {
     purge_advances: bool,
     phase: InstallPhase,
     drain: Option<crate::PersistenceDrain>,
-    offset_files: Option<std::fs::ReadDir>,
     directory_handle: Option<compio::fs::File>,
     offset_dirs_changed: [bool; 2],
     failure: Option<PartitionInstallError>,
@@ -1865,7 +1865,6 @@ enum InstallPhase {
     OpenSegments(usize),
     EmptyDirectory,
     OldOffsets(usize),
-    DeleteOffset { kind: usize, id: u32, path: String },
     CommitOffsets(usize),
     OffsetDirectory(usize),
     Publish,
@@ -1893,7 +1892,7 @@ enum InstallFilePhase {
     RenameLog(usize),
     OpenSegment(usize),
     EmptyDirectory,
-    DeleteOffset { kind: usize, id: u32 },
+    OldOffsets(usize),
     CommitOffset(usize),
     OffsetDirectory(usize),
     PurgeGeneration,
@@ -2013,13 +2012,10 @@ where
         config: &PartitionsConfig,
     ) -> Result<Rc<PartitionStateTransferOffer>, PartitionTransferUnavailable> {
         let offer = self.build_state_transfer_offer(config).await;
-        // A primary that has yet to apply what it committed keeps its plan:
-        // the plan still names committed state, and under steady writes the
-        // lag comes and goes between rounds.
-        if !offer.as_ref().is_err_and(|refusal| {
-            refusal.resumable()
-                || matches!(refusal, PartitionTransferUnavailable::NotCaughtUpPrimary)
-        }) {
+        if !offer
+            .as_ref()
+            .is_err_and(PartitionTransferUnavailable::resumable)
+        {
             self.transfer_plan.borrow_mut().take();
         }
         offer
@@ -2030,7 +2026,16 @@ where
         &mut self,
         config: &PartitionsConfig,
     ) -> Result<Rc<PartitionStateTransferOffer>, PartitionTransferUnavailable> {
-        if !consensus::is_caught_up_primary(self.consensus()) {
+        // An I/O owner pins the plan in a turn where the segments end at
+        // `commit_min`, so a primary still applying what it committed can
+        // serve. The inline flush runs through `commit_max` and needs the two
+        // equal.
+        let serving = if self.has_io_dispatcher() {
+            consensus::is_settled_primary(self.consensus())
+        } else {
+            consensus::is_caught_up_primary(self.consensus())
+        };
+        if !serving {
             return Err(PartitionTransferUnavailable::NotCaughtUpPrimary);
         }
         if self.partition_dir.is_none() {
@@ -2095,7 +2100,7 @@ where
         // not this shard's consensus ticks. A cold pass over multi-GiB
         // retention therefore silences every group on this core for its whole
         // duration, past `heartbeat_timeout`, on the node that by construction
-        // is the caught-up primary of those groups.
+        // is the primary of those groups.
         //
         // Bounded per round instead. The memo carries partial progress, so a
         // refusal here is not lost work: the requester re-asks on its flat
@@ -2700,6 +2705,15 @@ where
                     .checked_add(segment.index_staging.capacity())?
                     .checked_add(2 * (size_of::<PathBuf>() + 4 * size_of::<&Path>() + 4))
             }),
+            InstallPhase::OldOffsets(kind) => {
+                let retained = if kind == 0 {
+                    pending.offsets_wire.consumers.len()
+                } else {
+                    pending.offsets_wire.groups.len()
+                };
+                base.checked_add(self.offset_cleanup_charge(kind)?)?
+                    .checked_add(retained.checked_mul(size_of::<u32>())?)
+            }
             _ => Some(base),
         }
     }
@@ -2783,42 +2797,8 @@ where
             InstallPhase::OldOffsets(2) => {
                 install.phase = InstallPhase::CommitOffsets(0);
             }
-            InstallPhase::OldOffsets(kind) => {
-                let directory = if kind == 0 {
-                    self.consumer_offsets_path.as_deref()
-                } else {
-                    self.consumer_group_offsets_path.as_deref()
-                };
-                if install.offset_files.is_none() {
-                    install.offset_files = directory.and_then(|path| std::fs::read_dir(path).ok());
-                }
-                let table = if kind == 0 {
-                    &install.offsets_wire.consumers
-                } else {
-                    &install.offsets_wire.groups
-                };
-                let next = install.offset_files.as_mut().and_then(|entries| {
-                    entries.find_map(|entry| {
-                        let entry = entry.ok()?;
-                        if !entry.file_type().ok()?.is_file() {
-                            return None;
-                        }
-                        let name = entry.file_name();
-                        let id = name.to_str()?.parse::<u32>().ok()?;
-                        if install.next_offset > 0
-                            && table.binary_search_by_key(&id, |(id, _)| *id).is_ok()
-                        {
-                            return None;
-                        }
-                        Some((id, entry.path().to_string_lossy().into_owned()))
-                    })
-                });
-                if let Some((id, path)) = next {
-                    install.phase = InstallPhase::DeleteOffset { kind, id, path };
-                } else {
-                    install.offset_files = None;
-                    install.phase = InstallPhase::OldOffsets(kind + 1);
-                }
+            InstallPhase::OldOffsets(kind) if self.purge_offset_directory(kind).is_none() => {
+                install.phase = InstallPhase::OldOffsets(kind + 1);
             }
             InstallPhase::CommitOffsets(cursor) if cursor == install.planned_offsets.len() => {
                 install.phase = InstallPhase::OffsetDirectory(0);
@@ -3115,15 +3095,24 @@ where
                 crate::PartitionIoJob::SegmentDirectory(install.partition_dir.clone()),
                 InstallFilePhase::EmptyDirectory,
             ),
-            InstallPhase::DeleteOffset { kind, id, path } => (
-                crate::PartitionIoJob::OffsetDelete(crate::io::OffsetDeleteIoJob {
-                    path: path.clone(),
-                }),
-                InstallFilePhase::DeleteOffset {
-                    kind: *kind,
-                    id: *id,
-                },
-            ),
+            InstallPhase::OldOffsets(kind) => {
+                let table = if *kind == 0 {
+                    &install.offsets_wire.consumers
+                } else {
+                    &install.offsets_wire.groups
+                };
+                (
+                    self.capture_offset_cleanup(
+                        *kind,
+                        if install.next_offset > 0 {
+                            table.iter().map(|(id, _)| *id).collect()
+                        } else {
+                            Vec::new()
+                        },
+                    )?,
+                    InstallFilePhase::OldOffsets(*kind),
+                )
+            }
             InstallPhase::CommitOffsets(cursor) => (
                 file_job(crate::io::TransferFileJob::CommitOffset(
                     install.planned_offsets[*cursor].path.clone(),
@@ -3197,6 +3186,17 @@ where
         };
         let phase = std::mem::replace(&mut install.phase, InstallPhase::Done);
         let outcome = match (phase, result) {
+            (
+                InstallPhase::Submitted(InstallFilePhase::ClearMissing),
+                crate::PartitionIoResult::Transfer(crate::io::TransferFileResult::Finished(Err(
+                    error,
+                ))),
+            ) => {
+                // The install is already published. Keep its recovery marker
+                // without rolling back or fencing the installed data.
+                install.failure = Some(error);
+                Ok(InstallPhase::Done)
+            }
             (
                 InstallPhase::Submitted(phase),
                 crate::PartitionIoResult::Transfer(crate::io::TransferFileResult::Finished(
@@ -3277,8 +3277,8 @@ where
                     source,
                 }),
             (
-                InstallPhase::Submitted(InstallFilePhase::DeleteOffset { kind, id }),
-                crate::PartitionIoResult::OffsetDelete(outcome),
+                InstallPhase::Submitted(InstallFilePhase::OldOffsets(kind)),
+                crate::PartitionIoResult::PurgeOffsets(outcome),
             ) => {
                 let consumer_kind = if kind == 0 {
                     ConsumerKind::Consumer
@@ -3286,21 +3286,31 @@ where
                     ConsumerKind::ConsumerGroup
                 };
                 let capacity = self.consumer_offset_capacity_for(consumer_kind);
-                outcome
-                    .map(|removed| {
-                        install.offset_dirs_changed[kind] |= removed;
-                        capacity.clear_stranded(id);
-                        InstallPhase::OldOffsets(kind)
+                install.offset_dirs_changed[kind] |= outcome.changed;
+                for id in outcome.released {
+                    capacity.clear_stranded(id);
+                }
+                for id in &outcome.failed {
+                    capacity.record_stranded(*id);
+                }
+                if let Some(source) = outcome.scan_error {
+                    Err(PartitionInstallError::SwapIo {
+                        path: self
+                            .purge_offset_directory(kind)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        source,
                     })
-                    .map_err(|source| {
-                        capacity.record_stranded(id);
-                        PartitionInstallError::OffsetPersistence {
-                            path: self
-                                .persisted_offset_path(consumer_kind, id)
-                                .unwrap_or_default(),
-                            source,
-                        }
+                } else if let Some(id) = outcome.failed.first() {
+                    Err(PartitionInstallError::OffsetPersistence {
+                        path: self
+                            .persisted_offset_path(consumer_kind, *id)
+                            .unwrap_or_default(),
+                        source: iggy_common::IggyError::CannotDeleteFile,
                     })
+                } else {
+                    Ok(InstallPhase::OldOffsets(kind + 1))
+                }
             }
             (
                 InstallPhase::Submitted(InstallFilePhase::OffsetDirectory(kind)),
@@ -3499,16 +3509,17 @@ where
                 commit_min,
             });
         }
-        // The install rewinds the sequencer to `commit_op`, which erases ops
-        // this replica may already have journaled and acked. Bounding it below
-        // by what this replica knows to be COMMITTED keeps the erased window to
-        // ops it does not know are committed -- the checkable form of an
-        // argument the rewind's own comment only asserts. Free on an honest
-        // offer: only a caught-up primary can serve, so its `commit_min`
-        // equals its `commit_max`, and the receiver's descriptor gate already
-        // refused any peer whose `commit_max` was below this one's.
+        // The install wipes the journal and rewinds the sequencer to
+        // `commit_op`. A committed op this replica journaled past it may be one
+        // the quorum counted, so the install refuses to erase it. Ops known
+        // only from heartbeats are not held (a transferring replica journals
+        // nothing), and repair fetches them after the install. Refusing on
+        // `commit_max` alone would refuse every offer under steady writes:
+        // heartbeats carry the primary's `commit_min` past whatever op an offer
+        // pinned.
         let commit_max = self.consensus().commit_max();
-        if commit_op < commit_max {
+        let journal = &self.log.journal().inner;
+        if commit_op < commit_max && journal.holds_op_in(commit_op + 1..=commit_max) {
             return Err(PartitionInstallError::StaleTransfer {
                 commit_op,
                 commit_min: commit_max,
@@ -3624,7 +3635,6 @@ where
             purge_advances,
             phase: InstallPhase::StageOffsets(0),
             drain: None,
-            offset_files: None,
             directory_handle: None,
             offset_dirs_changed: [false; 2],
             failure: None,

@@ -823,6 +823,13 @@ where
         op_to_storage_offset.contains_key(&op)
     }
 
+    /// Whether any op in `ops` is resident, in one pass over the headers: the
+    /// range can be far wider than what is resident.
+    pub fn holds_op_in(&self, ops: RangeInclusive<u64>) -> bool {
+        let headers = unsafe { &*self.headers.get() };
+        headers.iter().any(|header| ops.contains(&header.op))
+    }
+
     /// Presence and message-carrying shape of the repair window `(floor, to_op]`
     /// in ONE pass over the header vec.
     ///

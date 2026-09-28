@@ -202,6 +202,12 @@ where
         self.get_mut(local)
     }
 
+    /// Capture writer ownership even when a previous teardown already tombstoned it.
+    pub fn capture_teardown(&self, namespace: &IggyNamespace) -> Option<crate::PartitionTeardown> {
+        let local = self.namespace_map().get(namespace).copied()?;
+        self.get(local).map(IggyPartition::capture_teardown)
+    }
+
     #[must_use]
     pub fn take_ready_loopbacks(&self) -> BTreeMap<IggyNamespace, crate::PartitionIncarnation> {
         std::mem::take(&mut *self.loopback_ready.partitions.borrow_mut())

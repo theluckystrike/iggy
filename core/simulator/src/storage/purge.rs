@@ -546,3 +546,46 @@ fn given_unremovable_bookmark_when_purge_completes_should_strand_it_until_a_late
         }
     });
 }
+
+#[test]
+fn given_offset_scan_failure_when_purging_should_remove_live_paths_without_recording_generation() {
+    block_on(async {
+        for policy in [Durability::Replicated, Durability::Persisted] {
+            let harness = PurgeStorageHarness::with_stored_progress(policy).await;
+            let mut partition = harness.empty_partition();
+            harness
+                .recover_progress(&mut partition, STORED_OFFSET)
+                .await;
+            let directory = harness.offset_directory(ConsumerKind::Consumer);
+            harness.storage.fail_at(0, FaultMode::Before);
+            assert!(matches!(
+                partition
+                    .complete_purge_with_storage(
+                        &partition_config(),
+                        &harness.storage,
+                        NEW_GENERATION,
+                    )
+                    .await,
+                Err(partitions::PurgeError::Unserviceable(_))
+            ));
+            assert_eq!(partition.applied_purge_generation(), OLD_GENERATION);
+            assert!(
+                harness
+                    .storage
+                    .entries(&directory)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut recovered = harness.empty_partition();
+            harness
+                .recover_progress(&mut recovered, STORED_OFFSET)
+                .await;
+            assert_eq!(recovered.applied_purge_generation(), OLD_GENERATION);
+            assert_eq!(
+                recovered.durable_consumer_offset_count(ConsumerKind::Consumer),
+                0
+            );
+        }
+    });
+}

@@ -537,6 +537,16 @@ where
             self.partition_io.release(token.slot);
         }
         match step {
+            partitions::PartitionIoStep::WireActions(actions) => {
+                self.partition_io.pop_ready(namespace, incarnation);
+                crate::dispatch_partition_wire_actions::<B, _, MJ, _>(
+                    partition.consensus(),
+                    partition,
+                    actions,
+                )
+                .await;
+                self.partition_io.reschedule(namespace, incarnation);
+            }
             partitions::PartitionIoStep::TransferReady => {
                 self.partition_io.pop_ready(namespace, incarnation);
                 self.on_partition_transfer_progress(namespace.inner()).await;
@@ -670,13 +680,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::time::Duration;
 
-    use consensus::{LocalPipeline, PartitionsHandle, VsrConsensus};
+    use consensus::{LocalPipeline, PartitionsHandle, Pipeline, VsrConsensus};
     use futures::FutureExt;
     use futures::channel::oneshot;
     use iggy_binary_protocol::primitives::consumer::WireConsumer;
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
     use iggy_binary_protocol::{
-        AckLevel, Command, ConsensusHeader, GenericHeader, Operation, ReplyHeader,
+        AckLevel, Command, ConsensusHeader, GenericHeader, Operation, PrepareOkHeader, ReplyHeader,
         RoutedRequestHeader, StartViewChangeHeader, WireEncode, WireIdentifier,
     };
     use iggy_common::{
@@ -693,12 +703,14 @@ mod tests {
         IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter, PartitionPathLayout,
         PartitionsConfig, RepairConclusion, RepairSession, Segment,
     };
+    use server_common::iobuf::Owned;
     use server_common::send_messages::{
         IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
     use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
     use server_common::{Message, SegmentStorage};
 
+    use crate::host::NoopHost;
     use crate::metrics::ShardMetrics;
     use crate::shards_table::{PapayaShardsTable, ShardsTable};
     use crate::{
@@ -964,6 +976,112 @@ mod tests {
     }
 
     #[compio::test]
+    async fn loopback_queues_drain_while_backup_acks_commit_between_rounds() {
+        const REQUESTS: usize = consensus::PIPELINE_PREPARE_QUEUE_MAX + 1;
+        const EVENTS_PER_REQUEST: usize = 3;
+        const PARTITIONS: usize =
+            REQUESTS * EVENTS_PER_REQUEST * crate::router::COOPERATIVE_EVENT_BUDGET
+                / consensus::PIPELINE_PREPARE_QUEUE_MAX
+                + TEST_PARTITIONS;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let (owner, _sender) = test_owner(&bus, None);
+        let partitions = owner.plane.partitions();
+        for partition_id in TEST_PARTITIONS..PARTITIONS {
+            let namespace = IggyNamespace::new(0, 0, partition_id);
+            let consensus = VsrConsensus::new(
+                1,
+                0,
+                1,
+                namespace.inner(),
+                Rc::clone(&bus),
+                LocalPipeline::new(),
+            );
+            consensus.init();
+            partitions.insert(
+                namespace,
+                IggyPartition::with_in_memory_storage(
+                    Arc::new(PartitionStats::default()),
+                    consensus,
+                    IggyByteSize::from(SEGMENT_BYTES),
+                ),
+            );
+        }
+        for partition_id in 0..PARTITIONS {
+            let namespace = IggyNamespace::new(0, 0, partition_id);
+            for request in 1..=consensus::PIPELINE_PREPARE_QUEUE_MAX {
+                partitions
+                    .on_request_with_reply(send_request(namespace, request as u64), None)
+                    .await;
+            }
+        }
+        let mut round = crate::router::LoopbackRound::default();
+        owner.process_loopback(&mut round).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        partitions.remove(&namespace).unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            namespace.inner(),
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        partitions.insert(
+            namespace,
+            IggyPartition::with_in_memory_storage(
+                Arc::new(PartitionStats::default()),
+                consensus,
+                IggyByteSize::from(SEGMENT_BYTES),
+            ),
+        );
+        for request in 1..=REQUESTS {
+            partitions
+                .on_request_with_reply(send_request(namespace, request as u64), None)
+                .await;
+            owner.process_loopback(&mut round).await;
+            let prepare = partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .consensus()
+                .with_pipeline(|pipeline| pipeline.entry_by_op(request as u64).unwrap().header);
+            for replica in [1, 2] {
+                let ack = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
+                    .transmute_header(|_, header: &mut PrepareOkHeader| {
+                        header.command = Command::PrepareOk;
+                        header.operation = prepare.operation;
+                        header.cluster = prepare.cluster;
+                        header.group = prepare.group;
+                        header.replica = replica;
+                        header.view = prepare.view;
+                        header.op = prepare.op;
+                        header.prepare_checksum = prepare.checksum;
+                        header.size = u32::try_from(size_of::<PrepareOkHeader>()).unwrap();
+                        header.seal();
+                    });
+                partitions
+                    .get_mut_by_ns(&namespace)
+                    .unwrap()
+                    .on_ack(ack, partitions.config())
+                    .await;
+                owner.process_loopback(&mut round).await;
+            }
+            assert_eq!(
+                partitions
+                    .get_by_ns(&namespace)
+                    .unwrap()
+                    .consensus()
+                    .commit_min(),
+                request as u64
+            );
+        }
+        assert!(
+            !round.entries.is_empty(),
+            "the original snapshot still spans pump events"
+        );
+    }
+
+    #[compio::test]
     async fn loopback_rounds_retain_namespace_order_and_reject_replaced_incarnations() {
         for replace_tail in [false, true] {
             let store = Rc::new(HeldSuperblock {
@@ -1028,7 +1146,7 @@ mod tests {
             }
             assert_eq!(
                 owner.process_loopback(&mut round).await,
-                consensus::PIPELINE_PREPARE_QUEUE_MAX
+                consensus::PIPELINE_PREPARE_QUEUE_MAX + 1
             );
             assert_eq!(
                 partitions
@@ -1036,8 +1154,8 @@ mod tests {
                     .unwrap()
                     .consensus()
                     .commit_min(),
-                next_request - 1,
-                "new self-acks cannot enter the unfinished round"
+                next_request,
+                "new self-acks follow the older snapshot entries"
             );
             assert_eq!(
                 partitions
@@ -1052,7 +1170,7 @@ mod tests {
                 },
                 "snapshot messages belong only to their captured incarnation",
             );
-            assert_eq!(owner.process_loopback(&mut round).await, 1);
+            assert_eq!(owner.process_loopback(&mut round).await, 0);
             assert_eq!(
                 partitions
                     .get_by_ns(&first_namespace)
@@ -1119,6 +1237,90 @@ mod tests {
         assert!(
             owner.partition_io.take_result(token).is_none(),
             "duplicate completion cannot accept a reused slot"
+        );
+    }
+
+    #[compio::test]
+    async fn view_change_sends_held_actions_as_soon_as_the_superblock_completes() {
+        const STEPS_MAX: usize = 8;
+        let store = Rc::new(HeldSuperblock {
+            entered: RefCell::new(None),
+            held: RefCell::new(None),
+        });
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |_, _, frame| {
+            captured.borrow_mut().push(frame);
+            Ok(())
+        }));
+        for replica in 1..3 {
+            assert!(bus.owner_table().try_claim(replica, 1));
+        }
+        let (owner, _sender) = test_owner(&bus, None);
+        let partitions = owner.plane.partitions();
+        let namespace = IggyNamespace::new(0, 0, 0);
+        partitions.remove(&namespace).unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            namespace.inner(),
+            Rc::clone(&bus),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let mut partition = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(SEGMENT_BYTES),
+        );
+        partition.set_superblock(store, None);
+        partitions.insert(namespace, partition);
+        partitions.set_io_notifier(
+            owner.partition_io.notifier(),
+            owner.partition_io.limits.bytes_max(),
+        );
+        let message = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
+            .transmute_header(|_, header: &mut StartViewChangeHeader| {
+                header.command = Command::StartViewChange;
+                header.size = u32::try_from(size_of::<StartViewChangeHeader>()).unwrap();
+                header.cluster = 1;
+                header.group = namespace.inner();
+                header.replica = 1;
+                header.view = 1;
+                header.seal();
+            });
+        owner.on_start_view_change(message).await;
+        assert!(sent.borrow().is_empty());
+        let partition = partitions.get_mut_by_ns(&namespace).unwrap();
+        let partitions::PartitionIoStep::Ready(plan) =
+            partition.resume_io(partitions.config()).await
+        else {
+            panic!("view change must queue its superblock write");
+        };
+        let captured = partition
+            .capture_io(plan, partitions.config())
+            .unwrap()
+            .unwrap();
+        let result = captured.job.execute().await;
+        partition.accept_io(captured.identity, result).unwrap();
+        captured.gate.unwrap().release();
+        for _ in 0..STEPS_MAX {
+            owner.service_partition_io().await;
+            if !sent.borrow().is_empty() {
+                break;
+            }
+        }
+        let sent = sent.borrow();
+        assert!(
+            sent.iter().any(|frame| {
+                let message =
+                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                        .unwrap();
+                message.header().command == Command::StartViewChange
+            }),
+            "the completion must send StartViewChange without a retransmission tick"
         );
     }
 
@@ -1628,10 +1830,7 @@ mod tests {
         let owner = IoTestShard::<B>::new(
             ShardIdentity::new(0, "partition-io-test".to_owned()),
             bus.clone(),
-            Rc::new(|_, _| {}),
-            Rc::new(|_, _| {}),
-            Rc::new(|_| {}),
-            Rc::new(|_| {}),
+            Rc::new(NoopHost),
             metadata,
             partitions,
             vec![sender.clone()],

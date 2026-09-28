@@ -2721,7 +2721,7 @@ where
 /// The next replica to try after a transfer against `failed_peer` failed.
 ///
 /// Prefers the view's primary: it is the only replica that can pass the serving
-/// side's caught-up-primary gate, so rotating by ring index alone can spend a
+/// side's primary gate, so rotating by ring index alone can spend a
 /// full backoff round on a backup that must refuse -- and, worse, can land on a
 /// phantom view-0 primary of an empty group. Falls back to walking the ring past
 /// the failed peer, skipping this replica; a cluster of two has no alternative
@@ -4178,8 +4178,8 @@ where
         self.plane.on_ack(prepare_ok).await;
     }
 
-    /// Service a snapshot in metadata/namespace/FIFO order. New self-acks
-    /// stay in their consensus queues until the following round.
+    /// Append ready self-acks in metadata/namespace/FIFO order on every call.
+    /// Backup acks can commit and refill a partition while older entries wait.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn process_loopback(&self, round: &mut router::LoopbackRound) -> usize
     where
@@ -4197,33 +4197,31 @@ where
             >,
     {
         let planes = self.plane.inner();
-        if round.entries.is_empty() {
-            if let Some(ref consensus) = planes.0.consensus {
-                consensus.drain_loopback_into(&mut round.scratch);
+        if let Some(ref consensus) = planes.0.consensus {
+            consensus.drain_loopback_into(&mut round.scratch);
+            round
+                .entries
+                .extend(round.scratch.drain(..).map(|message| (None, message)));
+        }
+        let ready = planes.1.0.take_ready_loopbacks();
+        for (namespace, incarnation) in ready {
+            let Some(partition) = planes
+                .1
+                .0
+                .get_by_ns(&namespace)
+                .filter(|partition| partition.incarnation() == incarnation)
+            else {
+                continue;
+            };
+            partition
+                .consensus()
+                .drain_loopback_into(&mut round.scratch);
+            round.entries.extend(
                 round
-                    .entries
-                    .extend(round.scratch.drain(..).map(|message| (None, message)));
-            }
-            let ready = planes.1.0.take_ready_loopbacks();
-            for (namespace, incarnation) in ready {
-                let Some(partition) = planes
-                    .1
-                    .0
-                    .get_by_ns(&namespace)
-                    .filter(|partition| partition.incarnation() == incarnation)
-                else {
-                    continue;
-                };
-                partition
-                    .consensus()
-                    .drain_loopback_into(&mut round.scratch);
-                round.entries.extend(
-                    round
-                        .scratch
-                        .drain(..)
-                        .map(|message| (Some(incarnation), message)),
-                );
-            }
+                    .scratch
+                    .drain(..)
+                    .map(|message| (Some(incarnation), message)),
+            );
         }
 
         let mut serviced = 0;
@@ -9145,9 +9143,9 @@ where
             return;
         }
         if header.available == 0 {
-            // A refusal the peer marked transient (it is momentarily not the
-            // caught-up primary, which `is_caught_up_primary` makes frequent
-            // under produce load) must not charge the consecutive-failure count:
+            // A refusal the peer marked transient (its offer build is still
+            // flushing or hashing, which is routine under produce load) must
+            // not charge the consecutive-failure count:
             // that count is reset only by a completed install, so ten routine
             // refusals pin the re-arm backoff at its 1024x ceiling while nothing
             // else recovers the partition -- repair keeps hitting the refused
@@ -9163,7 +9161,7 @@ where
             );
             if transient {
                 // The peer that refused is the node that would otherwise serve,
-                // and on the partition arm only a caught-up primary can. Keep
+                // and on the partition arm only the primary can. Keep
                 // asking it unless it is not the primary this replica knows: a
                 // rotation spends the next round on a backup that can only
                 // refuse, and the serving side's partial offer-build progress
@@ -9742,7 +9740,7 @@ where
     /// Re-arm after a refusal the serving peer marked TRANSIENT: schedule the
     /// next attempt on a flat interval and charge nothing.
     ///
-    /// "The peer is momentarily not the caught-up primary" is the common case
+    /// "The peer's offer build is still flushing or hashing" is the common case
     /// under produce load, and `transfer_failures` is reset only by a completed
     /// install, so charging it turns a transient into a stall measured in re-arm
     /// ceilings: nothing else recovers the partition meanwhile, since repair
@@ -9802,10 +9800,10 @@ where
     /// the charged and uncharged paths.
     ///
     /// `rotate` is false where the refusing peer is the only one that could
-    /// have served: only a caught-up primary passes `is_caught_up_primary`, so
-    /// rotating off it asks a backup that can answer nothing but another
-    /// refusal, and the serving side's partial offer-build progress is memoized
-    /// PER NODE, so the round spent on the backup also advances no hashing.
+    /// have served: only the primary serves, so rotating off it asks a backup
+    /// that can answer nothing but another refusal, and the serving side's
+    /// partial offer-build progress is memoized PER NODE, so the round spent on
+    /// the backup also advances no hashing.
     #[allow(clippy::future_not_send)]
     async fn schedule_partition_transfer_rearm(
         &self,
@@ -11802,6 +11800,7 @@ async fn dispatch_partition_wire_actions<B, P, J, SB>(
     SB: SuperblockStore,
 {
     if !partition.persist_superblock_if_needed().await {
+        partition.defer_wire_actions(actions);
         return;
     }
     if partition.requires_state_transfer() {

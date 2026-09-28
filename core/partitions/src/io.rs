@@ -97,7 +97,9 @@ pub enum PartitionIoJob<SB = PingPongSuperblock> {
     },
     PurgeOffsets {
         directory: String,
-        stranded: HashSet<u32>,
+        known: HashSet<u32>,
+        /// Sorted IDs preserved by a state-transfer install.
+        retained: Vec<u32>,
     },
     PurgeGeneration {
         path: String,
@@ -283,6 +285,7 @@ pub struct PartitionIoPlan {
 }
 
 pub enum PartitionIoStep {
+    WireActions(Vec<consensus::VsrAction>),
     Progress,
     Pending,
     Ready(PartitionIoPlan),
@@ -467,10 +470,12 @@ pub struct OffsetDirectoriesIoResult {
 }
 
 pub struct PurgeOffsetsIoResult {
-    /// Stranded consumer ids whose offset file the sweep removed.
+    /// Consumer ids whose offset files were removed or already absent.
     pub(crate) released: Vec<u32>,
     /// Consumer ids whose offset file could not be removed.
     pub(crate) failed: Vec<u32>,
+    pub(crate) scan_error: Option<std::io::Error>,
+    pub(crate) changed: bool,
 }
 
 impl MaterializationIoJob {
@@ -649,9 +654,10 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
             }
             Self::PurgeOffsets {
                 directory,
-                stranded,
+                known,
+                retained,
             } => PartitionIoResult::PurgeOffsets(
-                purge_offset_files(storage, &directory, &stranded).await,
+                purge_offset_files(storage, &directory, known, &retained).await,
             ),
             Self::PurgeGeneration {
                 path,
@@ -771,11 +777,14 @@ fn execution_allocation_charge<SB: SuperblockStore>() -> Option<usize> {
 async fn purge_offset_files<S: DurableStorage>(
     storage: &S,
     directory: &str,
-    stranded: &HashSet<u32>,
+    mut known: HashSet<u32>,
+    retained: &[u32],
 ) -> PurgeOffsetsIoResult {
     let mut result = PurgeOffsetsIoResult {
         released: Vec::new(),
         failed: Vec::new(),
+        scan_error: None,
+        changed: false,
     };
     let entries = futures::stream::once(storage.regular_files(Path::new(directory))).try_flatten();
     futures::pin_mut!(entries);
@@ -783,13 +792,17 @@ async fn purge_offset_files<S: DurableStorage>(
         let path = match entry {
             Ok(path) => path,
             Err(error) => {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    continue;
+                }
                 warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
                     path = directory,
                     %error,
-                    "failed to scan consumer offset directory during purge"
+                    "failed to scan consumer offset directory during cleanup"
                 );
+                result.scan_error = Some(error);
                 continue;
             }
         };
@@ -799,22 +812,58 @@ async fn purge_offset_files<S: DurableStorage>(
         let Some(consumer_id) = crate::state_transfer::numeric_offset_id(path) else {
             continue;
         };
+        let release = known.contains(&consumer_id)
+            && Path::new(path) == Path::new(directory).join(consumer_id.to_string());
+        if release {
+            known.remove(&consumer_id);
+        }
+        if retained.binary_search(&consumer_id).is_err() {
+            result.remove(storage, path, consumer_id, release).await;
+        }
+    }
+    // Live paths must still be removed if enumeration fails or skips an entry.
+    for consumer_id in known {
+        if retained.binary_search(&consumer_id).is_err() {
+            result
+                .remove(
+                    storage,
+                    &format!("{directory}/{consumer_id}"),
+                    consumer_id,
+                    true,
+                )
+                .await;
+        }
+    }
+    result
+}
+
+impl PurgeOffsetsIoResult {
+    async fn remove<S: DurableStorage>(
+        &mut self,
+        storage: &S,
+        path: &str,
+        consumer_id: u32,
+        release: bool,
+    ) {
         match delete_persisted_offset_with_storage(storage, path).await {
-            Ok(_) if stranded.contains(&consumer_id) => result.released.push(consumer_id),
-            Ok(_) => {}
+            Ok(removed) => {
+                self.changed |= removed;
+                if release {
+                    self.released.push(consumer_id);
+                }
+            }
             Err(error) => {
                 warn!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
                     path,
                     %error,
-                    "purge could not remove a consumer offset file"
+                    "could not remove a consumer offset file"
                 );
-                result.failed.push(consumer_id);
+                self.failed.push(consumer_id);
             }
         }
     }
-    result
 }
 
 impl TransferFileJob {
