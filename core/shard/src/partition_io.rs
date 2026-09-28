@@ -1279,7 +1279,10 @@ mod tests {
                     compio::time::sleep(TASK_POLL_INTERVAL).await;
                 }
             };
-            compio::time::timeout(REPLY_DEADLINE, finish).await.unwrap();
+            // Heap-pinned: on macOS `finish` outgrows clippy's `large_futures` cap.
+            compio::time::timeout(REPLY_DEADLINE, Box::pin(finish))
+                .await
+                .unwrap();
             owner.apply_reconcile_ops();
             assert_eq!(
                 partitions.get_io_owner(&namespace).is_some(),
