@@ -1183,7 +1183,7 @@ pub enum PartitionArtifactSource<'a> {
 /// The offsets artifact can include a full checkpoint prepare.
 #[derive(Debug)]
 pub struct PartitionStateTransferOffer {
-    /// `commit_min` when the offer's [`TransferPlan`] was pinned: the segments
+    /// `commit_min` when the offer's `TransferPlan` was pinned: the segments
     /// hold every op through it and none after it.
     pub commit_op: u64,
     /// Ascending base offset; one artifact per non-empty retained segment.
@@ -1994,7 +1994,7 @@ where
 
     /// Build (or serve from cache) this group's state-transfer offer.
     ///
-    /// Hashes against a [`TransferPlan`] pinned in the turn that found every
+    /// Hashes against a `TransferPlan` pinned in the turn that found every
     /// applied op in its segment, so the segments cover every committed
     /// `SendMessages` op through the plan's `commit_op`, the offset table
     /// covers every committed offset op, and commits that land between rounds
